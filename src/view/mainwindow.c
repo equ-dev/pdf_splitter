@@ -1,35 +1,6 @@
 #include "mainwindow.h"
 
 #define THUMB_PLACEHOLDER_WIDTH 140
-#define THUMB_PLACEHOLDER_HEIGHT 180
-
-/* A placeholder "page" widget standing in for a rendered thumbnail, so we
- * can verify the flowbox layout, spacing, and scrolling before any real
- * PDF is loaded (Phase 3). */
-static GtkWidget *
-make_placeholder_thumbnail (int page_number)
-{
-  GtkWidget *frame = gtk_frame_new (NULL);
-
-  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
-  gtk_widget_set_size_request (box, THUMB_PLACEHOLDER_WIDTH, THUMB_PLACEHOLDER_HEIGHT);
-  gtk_widget_add_css_class (box, "card");
-
-  GtkWidget *page_icon = gtk_image_new_from_icon_name ("text-x-generic-symbolic");
-  gtk_image_set_pixel_size (GTK_IMAGE (page_icon), 48);
-  gtk_widget_set_valign (page_icon, GTK_ALIGN_CENTER);
-  gtk_widget_set_vexpand (page_icon, TRUE);
-
-  char label_text[32];
-  g_snprintf (label_text, sizeof (label_text), "Page %d", page_number);
-  GtkWidget *label = gtk_label_new (label_text);
-
-  gtk_box_append (GTK_BOX (box), page_icon);
-  gtk_box_append (GTK_BOX (box), label);
-
-  gtk_frame_set_child (GTK_FRAME (frame), box);
-  return frame;
-}
 
 static GtkWidget *
 make_placeholder_chapter_row (const char *title, const char *page_range)
@@ -57,6 +28,45 @@ make_placeholder_chapter_row (const char *title, const char *page_range)
   return row;
 }
 
+GtkWidget *
+mainwindow_new_chapter_row (const char *title, const char *page_range)
+{
+  return make_placeholder_chapter_row (title, page_range);
+}
+
+GtkWidget *
+mainwindow_new_thumbnail_card (GdkTexture *texture, int page_number)
+{
+  GtkWidget *frame = gtk_frame_new (NULL);
+
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
+  gtk_widget_add_css_class (box, "card");
+
+  /* Request the picture's exact pixel size explicitly rather than giving
+   * only a width and letting GTK infer height from the paintable's
+   * intrinsic aspect ratio - that computation was observed to collapse to
+   * zero height on at least one real GTK 4.14 build, hiding the image
+   * entirely. Explicit width+height sidesteps that layout path. */
+  int tex_w = gdk_texture_get_width (texture);
+  int tex_h = gdk_texture_get_height (texture);
+  if (tex_w <= 0) tex_w = THUMB_PLACEHOLDER_WIDTH;
+  if (tex_h <= 0) tex_h = THUMB_PLACEHOLDER_WIDTH;
+
+  GtkWidget *picture = gtk_picture_new_for_paintable (GDK_PAINTABLE (texture));
+  gtk_picture_set_content_fit (GTK_PICTURE (picture), GTK_CONTENT_FIT_CONTAIN);
+  gtk_widget_set_size_request (picture, tex_w, tex_h);
+
+  char label_text[32];
+  g_snprintf (label_text, sizeof (label_text), "Page %d", page_number);
+  GtkWidget *label = gtk_label_new (label_text);
+
+  gtk_box_append (GTK_BOX (box), picture);
+  gtk_box_append (GTK_BOX (box), label);
+
+  gtk_frame_set_child (GTK_FRAME (frame), box);
+  return frame;
+}
+
 static GtkWidget *
 build_left_pane (MainWindow *mw)
 {
@@ -74,13 +84,8 @@ build_left_pane (MainWindow *mw)
   gtk_widget_set_margin_top (mw->thumbnail_flowbox, 8);
   gtk_widget_set_margin_bottom (mw->thumbnail_flowbox, 8);
 
-  /* Placeholder pages to prove the grid wraps and scrolls correctly.
-   * Phase 3 replaces this with real rendered thumbnails from the loaded
-   * PDF. */
-  for (int i = 1; i <= 12; i++) {
-    gtk_flow_box_append (GTK_FLOW_BOX (mw->thumbnail_flowbox),
-                          make_placeholder_thumbnail (i));
-  }
+  /* Starts empty; populated with real rendered thumbnails once a PDF is
+   * loaded (wired in the controller). */
 
   gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scrolled), mw->thumbnail_flowbox);
   return scrolled;
@@ -108,12 +113,8 @@ build_right_pane (MainWindow *mw)
   gtk_list_box_set_selection_mode (GTK_LIST_BOX (mw->chapter_listbox), GTK_SELECTION_SINGLE);
   gtk_widget_add_css_class (mw->chapter_listbox, "boxed-list");
 
-  /* Placeholder chapters to prove the sidebar layout before real chapter
-   * assignment is wired in (Phase 3). */
-  gtk_list_box_append (GTK_LIST_BOX (mw->chapter_listbox),
-                        make_placeholder_chapter_row ("Chapter 1", "Pages 1-12"));
-  gtk_list_box_append (GTK_LIST_BOX (mw->chapter_listbox),
-                        make_placeholder_chapter_row ("Chapter 2", "Pages 13-27"));
+  /* Starts empty; populated with real chapters as the user assigns
+   * page ranges (wired in the controller). */
 
   gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scrolled), mw->chapter_listbox);
   gtk_box_append (GTK_BOX (box), scrolled);
@@ -159,12 +160,83 @@ mainwindow_new (GtkApplication *app)
   gtk_paned_set_resize_start_child (GTK_PANED (paned), TRUE);
   gtk_paned_set_end_child (GTK_PANED (paned), build_right_pane (mw));
   gtk_paned_set_resize_end_child (GTK_PANED (paned), FALSE);
+  /* Never let the sidebar shrink below its natural size to fit whatever
+   * position value below happens to leave - on a system with larger
+   * default fonts/DPI than assumed here, the sidebar's real required
+   * width can exceed the leftover space, and shrink-end-child defaults
+   * to TRUE, which clips content rather than growing to fit it. */
+  gtk_paned_set_shrink_end_child (GTK_PANED (paned), FALSE);
   gtk_paned_set_position (GTK_PANED (paned), 720);
 
   gtk_window_set_child (GTK_WINDOW (mw->window), paned);
   gtk_window_present (GTK_WINDOW (mw->window));
 
   return mw;
+}
+
+GtkWidget *
+mainwindow_show_loading_dialog (GtkWindow *parent)
+{
+  GtkWidget *dialog = gtk_window_new ();
+  gtk_window_set_transient_for (GTK_WINDOW (dialog), parent);
+  gtk_window_set_modal (GTK_WINDOW (dialog), TRUE);
+  gtk_window_set_decorated (GTK_WINDOW (dialog), FALSE);
+  gtk_window_set_default_size (GTK_WINDOW (dialog), 260, 130);
+  gtk_window_set_resizable (GTK_WINDOW (dialog), FALSE);
+
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
+  gtk_widget_set_halign (box, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (box, GTK_ALIGN_CENTER);
+  gtk_widget_set_margin_top (box, 20);
+  gtk_widget_set_margin_bottom (box, 20);
+  gtk_widget_set_margin_start (box, 20);
+  gtk_widget_set_margin_end (box, 20);
+  gtk_widget_set_vexpand (box, TRUE);
+
+  GtkWidget *spinner = gtk_spinner_new ();
+  gtk_widget_set_size_request (spinner, 32, 32);
+  gtk_spinner_start (GTK_SPINNER (spinner));
+
+  GtkWidget *label = gtk_label_new ("Loading PDF...");
+
+  GtkWidget *progress = gtk_progress_bar_new ();
+  gtk_widget_set_size_request (progress, 200, -1);
+  gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (progress), 0.0);
+
+  gtk_box_append (GTK_BOX (box), spinner);
+  gtk_box_append (GTK_BOX (box), label);
+  gtk_box_append (GTK_BOX (box), progress);
+
+  /* Stash the progress bar on the dialog so mainwindow_set_loading_progress
+   * can find it later without the caller having to track it separately. */
+  g_object_set_data (G_OBJECT (dialog), "progress-bar", progress);
+
+  gtk_window_set_child (GTK_WINDOW (dialog), box);
+  gtk_window_present (GTK_WINDOW (dialog));
+
+  return dialog;
+}
+
+void
+mainwindow_set_loading_progress (GtkWidget *dialog, double fraction)
+{
+  if (dialog == NULL)
+    return;
+
+  if (fraction < 0.0) fraction = 0.0;
+  if (fraction > 1.0) fraction = 1.0;
+
+  GtkWidget *progress = g_object_get_data (G_OBJECT (dialog), "progress-bar");
+  if (progress != NULL)
+    gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (progress), fraction);
+}
+
+void
+mainwindow_close_loading_dialog (GtkWidget *dialog)
+{
+  if (dialog == NULL)
+    return;
+  gtk_window_destroy (GTK_WINDOW (dialog));
 }
 
 void

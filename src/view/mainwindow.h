@@ -33,4 +33,25 @@ MainWindow *mainwindow_new (GtkApplication *app);
 
 void mainwindow_free (MainWindow *mw);
 
+/* Build a chapter sidebar row (title + page range text). The controller
+ * calls this when a chapter is added; ownership passes to whatever
+ * container it's appended to (normal GTK parent/child ownership). */
+GtkWidget *mainwindow_new_chapter_row (const char *title, const char *page_range);
+
+/* Build a thumbnail grid card wrapping a rendered page texture. Takes its
+ * own reference to texture as GtkPicture normally does; caller retains
+ * ownership of its own reference. */
+GtkWidget *mainwindow_new_thumbnail_card (GdkTexture *texture, int page_number);
+
+/* Show a small modal "Loading..." dialog with a spinner and a progress
+ * bar, parented to the given window. Caller must close it with
+ * mainwindow_close_loading_dialog once loading finishes. */
+GtkWidget *mainwindow_show_loading_dialog (GtkWindow *parent);
+
+/* Update the loading dialog's progress bar. fraction is clamped to
+ * [0.0, 1.0]. Safe to call repeatedly as work completes. */
+void mainwindow_set_loading_progress (GtkWidget *dialog, double fraction);
+
+void mainwindow_close_loading_dialog (GtkWidget *dialog);
+
 #endif /* MAINWINDOW_H */
