@@ -51,6 +51,81 @@ static void update_unassigned_summary (AppController *controller);
 static void rebuild_chapter_sidebar (AppController *controller);
 static void on_row_remove_clicked (gpointer user_data);
 static void on_row_rename_changed (const char *new_title, gpointer user_data);
+static void on_export_all_clicked (GtkButton *button, gpointer user_data);
+
+/* Turns a user-editable chapter title into something safe to put in a
+ * filename: keeps alphanumerics/-/_, maps spaces to '_', drops anything
+ * else (path separators, quotes, emoji, etc). Falls back to "chapter" if
+ * that leaves nothing usable. Caller must g_free() the result. */
+static char *
+sanitize_filename_component (const char *title)
+{
+  GString *s = g_string_new (NULL);
+  for (const char *p = title; p != NULL && *p != '\0'; p++) {
+    if (g_ascii_isalnum (*p) || *p == '-' || *p == '_')
+      g_string_append_c (s, *p);
+    else if (*p == ' ')
+      g_string_append_c (s, '_');
+  }
+  if (s->len == 0)
+    g_string_append (s, "chapter");
+  return g_string_free (s, FALSE);
+}
+
+guint
+app_controller_export_chapters (PdfDoc *doc,
+                                 const ChapterSpec *chapters,
+                                 guint n_chapters,
+                                 const char *folder_path,
+                                 guint *out_failed,
+                                 char **out_failure_detail)
+{
+  g_return_val_if_fail (doc != NULL, 0);
+  g_return_val_if_fail (n_chapters == 0 || chapters != NULL, 0);
+  g_return_val_if_fail (folder_path != NULL, 0);
+
+  GString *failures = g_string_new (NULL);
+  guint n_ok = 0;
+
+  for (guint i = 0; i < n_chapters; i++) {
+    const ChapterSpec *spec = &chapters[i];
+
+    char *safe_title = sanitize_filename_component (spec->title);
+    char *filename = g_strdup_printf ("Chapter_%02u_%s.pdf", i + 1, safe_title);
+    char *out_path = g_build_filename (folder_path, filename, NULL);
+
+    GError *error = NULL;
+    if (pdfdoc_export_range (doc, spec->first_page, spec->last_page, out_path, &error)) {
+      n_ok++;
+    } else {
+      g_string_append_printf (failures, "%s%s: %s",
+                               failures->len > 0 ? "\n" : "",
+                               filename,
+                               error != NULL ? error->message : "unknown error");
+      g_clear_error (&error);
+    }
+
+    g_free (out_path);
+    g_free (filename);
+    g_free (safe_title);
+  }
+
+  if (out_failed != NULL)
+    *out_failed = n_chapters - n_ok;
+
+  if (out_failure_detail != NULL) {
+    if (failures->len > 0)
+      *out_failure_detail = g_string_free (failures, FALSE); /* hand off the buffer */
+    else {
+      *out_failure_detail = NULL;
+      g_string_free (failures, TRUE);
+    }
+  } else {
+    g_string_free (failures, TRUE);
+  }
+
+  return n_ok;
+}
 
 static int
 compare_chapter_start (gconstpointer a, gconstpointer b)
@@ -258,21 +333,29 @@ on_row_rename_changed (const char *new_title, gpointer user_data)
 }
 
 static void
-on_file_chooser_response (GtkNativeDialog *native, int response, gpointer user_data)
+on_open_file_dialog_finished (GObject *source, GAsyncResult *result, gpointer user_data)
 {
+  GtkFileDialog *dialog = GTK_FILE_DIALOG (source);
   AppController *controller = user_data;
 
-  if (response == GTK_RESPONSE_ACCEPT) {
-    GFile *file = gtk_file_chooser_get_file (GTK_FILE_CHOOSER (native));
-    char *path = g_file_get_path (file);
-    if (path != NULL) {
-      app_controller_load_pdf (controller, path);
-      g_free (path);
-    }
-    g_object_unref (file);
+  GError *error = NULL;
+  GFile *file = gtk_file_dialog_open_finish (dialog, result, &error);
+  if (file == NULL) {
+    /* GTK_DIALOG_ERROR_DISMISSED just means the user hit Cancel or
+     * closed the dialog - not worth a warning. Anything else (a real
+     * I/O or portal error) is. */
+    if (error != NULL && !g_error_matches (error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED))
+      g_warning ("open-file dialog failed: %s", error->message);
+    g_clear_error (&error);
+    return;
   }
 
-  g_object_unref (native);
+  char *path = g_file_get_path (file);
+  if (path != NULL) {
+    app_controller_load_pdf (controller, path);
+    g_free (path);
+  }
+  g_object_unref (file);
 }
 
 /*
@@ -336,19 +419,22 @@ on_open_clicked (GtkButton *button, gpointer user_data)
   (void) button;
   AppController *controller = user_data;
 
-  GtkFileChooserNative *native = gtk_file_chooser_native_new (
-      "Open PDF",
-      GTK_WINDOW (controller->mw->window),
-      GTK_FILE_CHOOSER_ACTION_OPEN,
-      "_Open", "_Cancel");
+  GtkFileDialog *dialog = gtk_file_dialog_new ();
+  gtk_file_dialog_set_title (dialog, "Open PDF");
 
   GtkFileFilter *filter = gtk_file_filter_new ();
   gtk_file_filter_set_name (filter, "PDF files");
   gtk_file_filter_add_mime_type (filter, "application/pdf");
-  gtk_file_chooser_add_filter (GTK_FILE_CHOOSER (native), filter);
 
-  g_signal_connect (native, "response", G_CALLBACK (on_file_chooser_response), controller);
-  gtk_native_dialog_show (GTK_NATIVE_DIALOG (native));
+  GListStore *filters = g_list_store_new (GTK_TYPE_FILE_FILTER);
+  g_list_store_append (filters, filter);
+  gtk_file_dialog_set_filters (dialog, G_LIST_MODEL (filters));
+  g_object_unref (filters);
+  g_object_unref (filter);
+
+  gtk_file_dialog_open (dialog, GTK_WINDOW (controller->mw->window), NULL,
+                        on_open_file_dialog_finished, controller);
+  g_object_unref (dialog);
 }
 
 static void
@@ -444,6 +530,108 @@ on_jump_entry_activate (GtkEntry *entry, gpointer user_data)
   jump_to_requested_page ((AppController *) user_data);
 }
 
+/* Runs after the user picks (or cancels) an output folder in
+ * on_export_all_clicked. Builds a plain ChapterSpec array (in page
+ * order, matching what's shown in the sidebar) and hands off to
+ * app_controller_export_chapters - this function's own job is just the
+ * GTK folder-dialog result and turning it into an alert. */
+static void
+on_export_folder_dialog_finished (GObject *source, GAsyncResult *result, gpointer user_data)
+{
+  GtkFileDialog *dialog = GTK_FILE_DIALOG (source);
+  AppController *controller = user_data;
+
+  GError *error = NULL;
+  GFile *folder = gtk_file_dialog_select_folder_finish (dialog, result, &error);
+  if (folder == NULL) {
+    if (error != NULL && !g_error_matches (error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED))
+      g_warning ("select-folder dialog failed: %s", error->message);
+    g_clear_error (&error);
+    return;
+  }
+
+  char *folder_path = g_file_get_path (folder);
+  g_object_unref (folder);
+
+  if (folder_path == NULL)
+    return;
+
+  GPtrArray *sorted = chapters_sorted_by_start (controller);
+
+  ChapterSpec *specs = g_new (ChapterSpec, sorted->len);
+  for (guint i = 0; i < sorted->len; i++) {
+    ChapterRange *r = g_ptr_array_index (sorted, i);
+    specs[i].first_page = r->first_page;
+    specs[i].last_page = r->last_page;
+    specs[i].title = r->title;
+  }
+
+  guint n_failed = 0;
+  char *failure_detail = NULL;
+  guint n_ok = app_controller_export_chapters (controller->doc, specs, sorted->len,
+                                                folder_path, &n_failed, &failure_detail);
+
+  GtkAlertDialog *alert;
+  if (n_failed == 0) {
+    char *detail = g_strdup_printf ("Wrote %u chapter file%s to %s",
+                                     n_ok, n_ok == 1 ? "" : "s", folder_path);
+    /* "%s" here means "treat this string as literal data, not as a
+     * format string" - gtk_alert_dialog_new is printf-style, so a
+     * bare NULL (the original bug: instant crash in g_strdup_vprintf)
+     * or a caller-controlled string containing a stray '%' (chapter
+     * titles, poppler error text, filenames) must never be passed
+     * directly as the format argument. */
+    alert = gtk_alert_dialog_new ("%s", "Export complete");
+    gtk_alert_dialog_set_detail (alert, detail);
+    g_free (detail);
+  } else {
+    char *detail = g_strdup_printf ("%u of %u chapters exported.%s%s",
+                                     n_ok, sorted->len,
+                                     failure_detail != NULL ? "\n" : "",
+                                     failure_detail != NULL ? failure_detail : "");
+    alert = gtk_alert_dialog_new ("%s", "Export finished with errors");
+    gtk_alert_dialog_set_detail (alert, detail);
+    g_free (detail);
+  }
+  gtk_alert_dialog_show (alert, GTK_WINDOW (controller->mw->window));
+  g_object_unref (alert);
+
+  g_free (failure_detail);
+  g_free (specs);
+  g_ptr_array_free (sorted, TRUE);
+  g_free (folder_path);
+}
+
+static void
+on_export_all_clicked (GtkButton *button, gpointer user_data)
+{
+  (void) button;
+  AppController *controller = user_data;
+
+  if (controller->doc == NULL) {
+    GtkAlertDialog *alert = gtk_alert_dialog_new ("%s", "No PDF loaded");
+    gtk_alert_dialog_set_detail (alert, "Open a PDF before exporting chapters.");
+    gtk_alert_dialog_show (alert, GTK_WINDOW (controller->mw->window));
+    g_object_unref (alert);
+    return;
+  }
+
+  if (controller->chapters->len == 0) {
+    GtkAlertDialog *alert = gtk_alert_dialog_new ("%s", "No chapters defined");
+    gtk_alert_dialog_set_detail (alert, "Select page ranges and click Add Chapter first.");
+    gtk_alert_dialog_show (alert, GTK_WINDOW (controller->mw->window));
+    g_object_unref (alert);
+    return;
+  }
+
+  GtkFileDialog *dialog = gtk_file_dialog_new ();
+  gtk_file_dialog_set_title (dialog, "Choose output folder");
+
+  gtk_file_dialog_select_folder (dialog, GTK_WINDOW (controller->mw->window), NULL,
+                                 on_export_folder_dialog_finished, controller);
+  g_object_unref (dialog);
+}
+
 AppController *
 app_controller_new (MainWindow *mw)
 {
@@ -458,6 +646,7 @@ app_controller_new (MainWindow *mw)
   g_signal_connect (mw->add_chapter_button, "clicked", G_CALLBACK (on_add_chapter_clicked), controller);
   g_signal_connect (mw->page_jump_button, "clicked", G_CALLBACK (on_jump_button_clicked), controller);
   g_signal_connect (mw->page_jump_entry, "activate", G_CALLBACK (on_jump_entry_activate), controller);
+  g_signal_connect (mw->export_button, "clicked", G_CALLBACK (on_export_all_clicked), controller);
 
   GtkGesture *range_click_gesture = gtk_gesture_click_new ();
   gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (range_click_gesture), GTK_PHASE_CAPTURE);
