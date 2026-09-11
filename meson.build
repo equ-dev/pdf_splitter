@@ -7,3 +7,4 @@ poppler_dep = dependency('poppler-glib')
 
 subdir('src')
 subdir('tests')
+subdir('bench')

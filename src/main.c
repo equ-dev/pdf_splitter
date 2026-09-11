@@ -15,10 +15,10 @@ activate (GtkApplication *app, gpointer user_data)
    * app's lifetime - a single top-level window/controller pair that lives
    * until the process exits. Revisit if we ever support multiple windows
    * or explicit close-time cleanup. */
-  MainWindow *mw = mainwindow_new (app);
-  AppController *controller = app_controller_new (mw);
+ MainWindow *mw = mainwindow_new (app);
+ AppController *controller = app_controller_new (mw);
 
-  if (startup_pdf_path != NULL)
+ if (startup_pdf_path != NULL)
     app_controller_load_pdf (controller, startup_pdf_path);
 }
 
