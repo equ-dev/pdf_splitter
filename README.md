@@ -10,11 +10,19 @@ ranges, and export each chapter as its own PDF.
 
 - **Open PDF** — pick any local PDF; every page renders as a real thumbnail
   in a scrollable grid.
+- **Go to page** — jump straight to a page number instead of scrolling
+  through a long book by hand.
 - **Range selection** — click a page, then Shift+click another to select
   everything in between. Click a selected page again to clear the selection.
 - **Chapters** — click **Add Chapter** to turn the current selection into a
-  chapter entry in the sidebar (`Chapter 1: Pages 21-32`, etc). **Remove**
-  deletes a chapter and renumbers the rest.
+  chapter entry in the sidebar. Each chapter gets its own color, shown both
+  as a stripe on every thumbnail it covers and as a tint on its sidebar
+  card, so it's obvious at a glance which pages belong to which chapter.
+- **Rename inline** — click a chapter's title in the sidebar to edit it in
+  place; no dialog required.
+- **Remove** — each chapter card has its own Remove button.
+- **Unassigned pages** — the sidebar lists any page ranges not yet claimed
+  by a chapter, so gaps don't go unnoticed before export.
 - **Export All** — writes each chapter to its own `Chapter_01.pdf`,
   `Chapter_02.pdf`, ... file.
 - A loading dialog with a spinner and progress bar covers the (synchronous)
