@@ -4,6 +4,16 @@
 
 #define THUMBNAIL_WIDTH_PX 140
 
+/* How often (in pages) to drain the event loop while populating
+ * thumbnails. Draining every single page forces GTK to process the
+ * flowbox's pending resize/relayout on every append, and that relayout
+ * cost scales with however many children are already in the box -
+ * pumping once per page turns an O(n) total layout cost into an O(n^2)
+ * one over the whole load. Batching the drain trades a bit of animation
+ * smoothness (the progress bar updates in steps instead of continuously)
+ * for a much smaller number of full layout passes. */
+#define PUMP_INTERVAL_PAGES 25
+
 typedef struct {
   int first_page; /* 0-indexed */
   int last_page;  /* 0-indexed, inclusive */
@@ -22,9 +32,29 @@ populate_thumbnails (AppController *controller, GtkWidget *loading)
   gtk_flow_box_remove_all (GTK_FLOW_BOX (controller->mw->thumbnail_flowbox));
 
   int n_pages = pdfdoc_get_page_count (controller->doc);
+
+  /* --- PERF: temporary instrumentation, remove once attributed --- *
+   * Buckets time into: rendering (already measured separately by
+   * bench/render_timing_harness), widget construction (texture + card),
+   * the flowbox append itself, the progress bar update, and the manual
+   * event-loop drain. Printed every 200 pages plus a final summary so we
+   * can see both totals and whether any bucket grows as the flowbox
+   * fills up (which would point at O(n) relayout-per-append). */
+  gint64 perf_render_us = 0;
+  gint64 perf_widget_build_us = 0;
+  gint64 perf_append_us = 0;
+  gint64 perf_progress_us = 0;
+  gint64 perf_pump_us = 0;
+  gint64 perf_loop_start = g_get_monotonic_time ();
+
   for (int i = 0; i < n_pages; i++) {
+    gint64 t0 = g_get_monotonic_time ();
+
     GError *error = NULL;
     GdkPixbuf *pixbuf = pdfdoc_render_page_thumbnail (controller->doc, i, THUMBNAIL_WIDTH_PX, &error);
+    gint64 t1 = g_get_monotonic_time ();
+    perf_render_us += (t1 - t0);
+
     if (pixbuf == NULL) {
       g_warning ("failed to render page %d: %s", i, error->message);
       g_error_free (error);
@@ -36,18 +66,45 @@ populate_thumbnails (AppController *controller, GtkWidget *loading)
 
     GtkWidget *card = mainwindow_new_thumbnail_card (texture, i + 1);
     g_object_unref (texture); /* GtkPicture holds its own reference. */
+    gint64 t2 = g_get_monotonic_time ();
+    perf_widget_build_us += (t2 - t1);
 
     gtk_flow_box_append (GTK_FLOW_BOX (controller->mw->thumbnail_flowbox), card);
+    gint64 t3 = g_get_monotonic_time ();
+    perf_append_us += (t3 - t2);
 
     if (n_pages > 0)
       mainwindow_set_loading_progress (loading, (double) (i + 1) / (double) n_pages);
+    gint64 t4 = g_get_monotonic_time ();
+    perf_progress_us += (t4 - t3);
 
     /* Rendering every page synchronously can take a noticeable moment on
-     * long textbooks. Drain pending main-loop events each iteration so
-     * the loading spinner/progress bar actually animate and the window
-     * stays responsive instead of appearing frozen. */
-    while (g_main_context_iteration (NULL, FALSE)) { }
+     * long textbooks, so we still need to drain the event loop
+     * periodically - otherwise the window looks frozen and the loading
+     * spinner/progress bar never animate. But draining on *every* page
+     * forces a full flowbox relayout per page (see PUMP_INTERVAL_PAGES
+     * comment above), so we batch it instead. */
+    if (i % PUMP_INTERVAL_PAGES == 0 || i == n_pages - 1) {
+      while (g_main_context_iteration (NULL, FALSE)) { }
+    }
+    gint64 t5 = g_get_monotonic_time ();
+    perf_pump_us += (t5 - t4);
+
+    if (i > 0 && i % 200 == 0) {
+      fprintf (stderr,
+        "PERF page %d: cumulative render=%.2fs build=%.2fs append=%.2fs progress=%.2fs pump=%.2fs\n",
+        i, perf_render_us / 1e6, perf_widget_build_us / 1e6,
+        perf_append_us / 1e6, perf_progress_us / 1e6, perf_pump_us / 1e6);
+    }
   }
+
+  gint64 perf_loop_total_us = g_get_monotonic_time () - perf_loop_start;
+  fprintf (stderr,
+    "PERF FINAL (%d pages): render=%.3fs build=%.3fs append=%.3fs progress=%.3fs pump=%.3fs loop_total=%.3fs\n",
+    n_pages, perf_render_us / 1e6, perf_widget_build_us / 1e6,
+    perf_append_us / 1e6, perf_progress_us / 1e6, perf_pump_us / 1e6,
+    perf_loop_total_us / 1e6);
+  /* --- end PERF instrumentation --- */
 }
 
 static void
